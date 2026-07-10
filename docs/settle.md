@@ -1,0 +1,83 @@
+# Atomic FX Settlement Across Two Blockchains — Without a Middleman
+
+*How two banks on two different chains can swap currencies with payment-versus-payment protection, using one-way locks and portable cryptographic proofs.*
+
+---
+
+## The problem
+
+Bank A holds dollars on **Chain X**. Bank B holds euros on **Chain Y**. They've agreed on an FX trade and now need to settle it. The two chains are separate worlds — they can't see each other — and neither bank wants to pay first. Whoever pays first is exposed: if the other side walks away, they've lost the money and received nothing. This is FX settlement risk (the industry calls it Herstatt risk), and it's why PvP — *payment versus payment* — exists: **either both payments happen, or neither does.**
+
+The classic fix is a trusted intermediary that takes in both payments and swaps them. Here's how to get the same guarantee with no intermediary at all — just smart contracts, signatures, and math.
+
+## The core idea
+
+Each bank locks its payment in a smart contract vault **on its own chain**. Each vault will open for the counterparty only when shown *cryptographic proof that the mirror vault on the other chain is locked too*. The proof is a small, portable package of data: anyone can carry it between chains, and the receiving contract can verify it mathematically — without ever connecting to the other network, and without caring who delivered it.
+
+Three properties make this safe, and they're worth keeping in mind throughout:
+
+1. **One-way locks.** Once a bank locks funds, it cannot take them back until a pre-agreed timeout expires. No lock-then-secretly-withdraw.
+2. **Portable proofs.** A chain's state is summarized in a fingerprint signed by its validators. A proof shows "this vault provably contains this locked payment" against that fingerprint. Faking one means either breaking the math or stealing the validators' keys.
+3. **Verify math, not messengers.** The contracts trust the proof, not the party who submitted it. Anyone can submit — which turns out to matter a lot.
+
+## The flow, step by step
+
+### Step 0 — Sign the intent (off-chain, before anything moves)
+
+Bank A and Bank B agree the terms and **both sign a single settlement instruction**: a unique settlement ID, the amounts and currencies, who receives what, the lock timeouts for each side, and an expiry on the instruction itself (so a signed-but-abandoned deal can't be resurrected later). Signatures are exchanged; each bank holds the complete signed package.
+
+At this point, nothing is on-chain and no money is committed. Consent exists, but it's inert.
+
+### Step 1 — Lock, and verify the intent (on-chain, per chain)
+
+Bank A deposits the dollars into the vault on Chain X, presenting the signed instruction with **both signatures**. The vault checks: both signatures are valid, the deposit exactly matches the signed terms (amount, currency, beneficiary Bank B, agreed timeout), the instruction hasn't expired, the settlement ID hasn't been used. Only then does it lock — and it stores a hash of the instruction inside the lock record.
+
+Bank B does the mirror on Chain Y, locking the euros for Bank A under the *same* signed instruction.
+
+**This is where the intent is verified** — at the door of each vault, independently, on each chain. A lock with tampered terms either gets rejected outright or carries a different instruction hash, which (as we'll see) makes it worthless. Bad data can't enter the system.
+
+### Step 2 — Generate the proofs
+
+Each chain continuously produces validator-signed fingerprints of its full state. From Chain X, anyone with node access extracts a compact proof: *"Chain X's validators signed a state in which the vault holds Bank A's locked dollars for Bank B, under instruction hash H, until timeout T."* Same on Chain Y for the euro lock.
+
+No secrets involved — these proofs are derived from public chain data.
+
+### Step 3 — Exchange and claim (in parallel)
+
+Now each bank collects from the *other* chain by proving its *own* lock:
+
+- **Bank A** takes the proof of its dollar lock on X and presents it to the vault on **Chain Y**. That vault verifies Chain X's validator signatures, verifies the proof math, and checks two things against its own euro lock: the **instruction hashes match** (same signed deal), and the dollar lock has **enough time left on its clock** — more on that below. All checks pass → euros released to Bank A.
+- **Bank B** does the mirror: proves the euro lock on Y to the vault on **Chain X**, receives the dollars.
+
+The two claims are independent — no ordering, no coordination. And because claims need only public proof data, *anyone* can submit them: the banks themselves, or a neutral watcher service acting as a backstop. Nobody's payout depends on their counterparty lifting a finger.
+
+### Step 4 — Or unwind
+
+If Bank B never locks, Bank B can never produce a valid proof — so the dollars are unclaimable by anyone, and after the timeout Bank A's vault simply refunds. One-sided payment can't happen through the front door. The signed intent from Step 0 becomes the evidence for handling the no-show through business channels, but no money was lost.
+
+## The clock problem — and the rule that solves it
+
+One attack deserves a closer look, because it's the subtle one. Suppose Bank A locks with a 2-hour timeout, and Bank B locks at the last minute, immediately claims the dollars, and hopes Bank A's window to claim the euros runs out. Two defenses stack:
+
+**Timeouts are signed, not chosen.** The timeouts live in the dual-signed instruction, and each vault verified them at lock time. Bank B can lock *late*, but only with the pre-agreed timeout on its own euros — it can't manufacture a squeeze-friendly short one.
+
+**The runway rule.** Every vault applies one symmetric check at claim time: *a claim is accepted only if the counterparty's lock provably has at least Δ time remaining* (Δ sized generously — say 30–60 minutes against multi-hour timeouts — to cover proof generation, submission, a retry, and clock skew between chains). The timeout is stored inside the lock record, so it travels within the proof itself.
+
+The elegant consequence: **every successful claim is itself on-chain proof that the other side has time to collect.** The very transaction in which Bank B takes the dollars *verifies* that Bank A's euro claim has at least Δ of runway. The squeeze isn't discouraged — it's structurally impossible.
+
+## The honest risk list
+
+No cross-chain design gives you single-transaction atomicity across sovereign networks. What this design guarantees is: **both payments become claimable, or neither does.** The remaining risks, plainly:
+
+- **Liveness at the edge.** "Claimable" isn't "claimed." If both locks exist but a claim sits unsubmitted until the lock behind it expires, one side can end up whole while the other refunds late — a one-sided outcome via inaction, not attack. Mitigations: fat claim windows relative to Δ, permissionless claims (any single honest watcher anywhere completes a leg), and monitoring — "leg 1 claimed, leg 2 unclaimed, runway shrinking" is a pageable, provable condition.
+- **Validator trust.** Proofs are only as good as the fingerprints they verify against. If two-thirds of a chain's validators collude, they can sign fiction. In an interbank network the validators *are* the member institutions — so this is governed by membership agreements, key custody, and audit, and it's the single trust assumption a risk committee needs to sign off: *a lock is accepted as real iff two-thirds of the counterparty network's members cryptographically vouched for the block containing it.*
+- **Signed but unfunded.** The intent creates consent, not an obligation to lock. A counterparty can sign and never show up, costing the other side a locked-capital window until refund. Cryptography can't force a deposit; this belongs to the scheme's conduct rules — and the signed instruction is exactly the evidence that process needs.
+- **Capital efficiency.** Funds sit locked for the settlement window. Shorter windows reduce carry but tighten the liveness margins; the timeout and Δ are a risk dial the scheme sets deliberately, not a technical constant.
+
+## The takeaway
+
+Strip away the cryptography and the design is three ideas: **sign the deal once, together** — then let each vault check that signature at the door; **lock through one-way doors** — so "proven locked" means "still locked"; and **let math, not messengers, move value** — so anyone can carry a proof, and no one can forge one. Herstatt risk doesn't get managed here; it gets engineered out, minus one honest liveness assumption that fat windows and a watchful eye reduce to operational routine.
+
+---
+
+*A follow-up post will look under the hood: how validator signatures travel inside block headers, what the proofs actually contain, and what changes when a third chain joins the network.*
